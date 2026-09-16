@@ -56,6 +56,31 @@ _LOCK_TIMEOUT_OPTION = typer.Option(
 )
 
 
+@recovery_app.command("sandbox-upgrade-status")
+def sandbox_upgrade_status(
+    home: Path = typer.Option(..., "--home", exists=True, file_okay=False),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Inspect optional sandbox normalization without changing the profile."""
+    # Keep the ordinary recovery process below the runtime import boundary.
+    # ``opensquilla.sandbox`` exposes a broad public surface at package import
+    # time; only this diagnostic command needs the migration implementation.
+    from opensquilla.sandbox.upgrade_migration import inspect_sandbox_upgrade
+
+    report = inspect_sandbox_upgrade(home)
+    if json_output:
+        typer.echo(json.dumps(report.to_dict(), ensure_ascii=False, sort_keys=True))
+    else:
+        typer.echo(f"{report.status}: {'ready' if report.ok else 'retry pending'}")
+        legacy_journal = report.journal_path if report.journal_path.exists() else "-"
+        typer.echo(f"legacy journal: {legacy_journal}")
+        typer.echo(f"legacy snapshot: {report.snapshot_path or '-'}")
+        if report.error:
+            typer.echo(report.error, err=True)
+    if not report.ok:
+        raise typer.Exit(code=2)
+
+
 def _emit(report: RecoveryReport, *, json_output: bool) -> None:
     if json_output:
         typer.echo(json.dumps(report.as_dict(), ensure_ascii=False, sort_keys=True))

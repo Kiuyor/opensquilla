@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { ref } from 'vue'
+import type { SkillCatalog } from '@/modules/skillCatalog'
+import type { Skill } from '@/types/skills'
 import { useSkillsCatalog } from './useSkillsCatalog'
 
 // Regression (issue #1018): filtering the skills catalog crashed with
@@ -9,10 +11,7 @@ import { useSkillsCatalog } from './useSkillsCatalog'
 // filter tolerates legacy payloads (mixed-version gateways) defensively.
 
 function makeCatalog(skills: unknown[]) {
-  const rpc = {
-    waitForConnection: async () => {},
-    call: async () => ({ skills }),
-  }
+  const catalog: Pick<SkillCatalog, 'list'> = { list: async () => skills as Skill[] }
   const options = {
     proposals: ref([]),
     autoEnabledSkills: ref([]),
@@ -25,11 +24,11 @@ function makeCatalog(skills: unknown[]) {
     }),
     loadProposals: async () => {},
   }
-  return useSkillsCatalog(rpc as never, options)
+  return useSkillsCatalog(catalog as SkillCatalog, options)
 }
 
 describe('useSkillsCatalog trigger filtering', () => {
-  it('does not crash when a skill trigger element is not a string', async () => {
+  it.each(['dub', '123', 'nested'])('filters legacy mixed triggers for %s', async (query) => {
     const catalog = makeCatalog([
       {
         name: 'media-tool',
@@ -41,10 +40,10 @@ describe('useSkillsCatalog trigger filtering', () => {
         eligible: true,
       },
     ])
-    await catalog.loadData()
-    catalog.filterText.value = 'dub'
+    expect(await catalog.loadData()).toBe(true)
+    catalog.filterText.value = query
     expect(() => catalog.filteredSkills.value).not.toThrow()
-    // The string trigger still matches even though name/description do not.
+    // Search reaches triggers because neither the name nor description matches.
     expect(catalog.filteredSkills.value.map(s => s.name)).toEqual(['media-tool'])
   })
 
@@ -60,7 +59,7 @@ describe('useSkillsCatalog trigger filtering', () => {
         eligible: true,
       },
     ])
-    await catalog.loadData()
+    expect(await catalog.loadData()).toBe(true)
     catalog.filterText.value = 'dubb'
     expect(catalog.filteredSkills.value.map(s => s.name)).toEqual(['translate'])
   })

@@ -125,7 +125,7 @@ async function selectRuntimeGateway() {
   return sourceRuntimeGatewayDir
 }
 
-function smokeEnv(tempHome, config) {
+function smokeEnv(tempHome, config, runtimeGatewayDir) {
   const env = {}
   for (const [key, value] of Object.entries(process.env)) {
     if (key.startsWith('OPENSQUILLA_')) continue
@@ -143,6 +143,7 @@ function smokeEnv(tempHome, config) {
     // Runtime databases still live below H/state; config must remain at H/config.toml.
     OPENSQUILLA_STATE_DIR: tempHome,
     OPENSQUILLA_GATEWAY_CONFIG_PATH: config,
+    OPENSQUILLA_CONTROL_UI_DIST: join(runtimeGatewayDir, 'control-ui-dist'),
     PYTHONUNBUFFERED: '1',
     PYTHONUTF8: '1',
     PYTHONIOENCODING: 'utf-8:replace',
@@ -176,7 +177,7 @@ function verifyGatewayFilesystemWorker(gatewayBinary, env, targetPath) {
     path: targetPath,
     displayPath: targetPath,
   })
-  const result = spawnSync(gatewayBinary, ['--_sandbox-filesystem-worker'], {
+  const result = spawnSync(gatewayBinary, ['--internal-child', 'filesystem-worker', '-'], {
     cwd: dirname(gatewayBinary),
     env,
     input: payload,
@@ -197,6 +198,29 @@ function verifyGatewayFilesystemWorker(gatewayBinary, env, targetPath) {
   ) {
     throw new Error(
       `Packaged gateway filesystem worker probe failed with exit ${result.status ?? 'null'}.`
+        + formatTail(
+          result.stdout ? result.stdout.trim().split(/\r?\n/) : [],
+          result.stderr ? result.stderr.trim().split(/\r?\n/) : [],
+        ),
+    )
+  }
+}
+
+function verifyGatewayToolSearch(gatewayBinary, env) {
+  const result = spawnSync(gatewayBinary, ['--_desktop-tool-search-probe'], {
+    cwd: dirname(gatewayBinary),
+    env,
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: 20_000,
+  })
+  if (result.error) throw result.error
+  if (
+    result.status !== 0
+    || result.stdout.trim() !== 'opensquilla-desktop-tool-search-ok'
+  ) {
+    throw new Error(
+      `Packaged gateway tool-search resource probe failed with exit ${result.status ?? 'null'}.`
         + formatTail(
           result.stdout ? result.stdout.trim().split(/\r?\n/) : [],
           result.stderr ? result.stderr.trim().split(/\r?\n/) : [],
@@ -430,8 +454,9 @@ async function main() {
       'utf8'
     )
 
-    const env = smokeEnv(tempHome, config)
+    const env = smokeEnv(tempHome, config, runtimeGatewayDir)
     verifyGatewayCaStore(gatewayBinary, env)
+    verifyGatewayToolSearch(gatewayBinary, env)
     verifyGatewayFilesystemWorker(gatewayBinary, env, join(workspaceDir, 'SOUL.md'))
 
     const port = await findFreePort()

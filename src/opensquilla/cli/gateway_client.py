@@ -12,6 +12,13 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 from urllib.parse import urlparse
 
+from opensquilla.contracts.adapters.sessions_list_contract import call_sessions_list
+from opensquilla.contracts.adapters.sessions_resolve_contract import call_sessions_resolve
+from opensquilla.contracts.gateway_transport import (
+    ANSWER_GENERATION_RESET_CAPABILITY,
+    GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
+    GATEWAY_CLIENT_MAX_QUEUE,
+)
 from opensquilla.session.terminal_reply import build_terminal_reply, sanitize_agent_error
 
 
@@ -399,7 +406,11 @@ class GatewayClient:
             raise SystemExit("websockets package is required: uv pip install websockets")
 
         try:
-            self._ws = await websockets.connect(url)
+            self._ws = await websockets.connect(
+                url,
+                max_size=GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
+                max_queue=GATEWAY_CLIENT_MAX_QUEUE,
+            )
         except Exception as exc:
             raise SystemExit(
                 f"Cannot connect to OpenSquilla gateway at {url}\n"
@@ -442,6 +453,7 @@ class GatewayClient:
         params: dict[str, Any] = {
             "minProtocol": 1,
             "maxProtocol": 3,
+            "caps": [ANSWER_GENERATION_RESET_CAPABILITY],
             "role": "operator",
             "scopes": ["operator.admin"],
         }
@@ -679,7 +691,7 @@ class GatewayClient:
         return cast(str, result["key"])
 
     async def list_sessions(self, limit: int = 50) -> dict[str, Any]:
-        return cast(dict[str, Any], await self._call("sessions.list", {"limit": limit}))
+        return await call_sessions_list(self._call, limit=limit)
 
     async def preview_sessions(
         self,
@@ -692,7 +704,7 @@ class GatewayClient:
         return cast(dict[str, Any], await self._call("sessions.preview", params))
 
     async def resolve_session(self, key: str) -> dict[str, Any]:
-        return cast(dict[str, Any], await self._call("sessions.resolve", {"key": key}))
+        return await call_sessions_resolve(self._call, key=key)
 
     async def bootstrap_session(
         self,
@@ -883,6 +895,27 @@ class GatewayClient:
         result = await self._call("models.routing.set", {"mode": mode})
         return result if isinstance(result, dict) else {}
 
+    async def get_session_routing(self, key: str) -> dict[str, Any]:
+        result = await self._call("sessions.routing.get", {"sessionKey": key})
+        return result if isinstance(result, dict) else {}
+
+    async def set_session_routing(
+        self,
+        key: str,
+        mode: str,
+        *,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        result = await self._call(
+            "sessions.routing.set",
+            {
+                "sessionKey": key,
+                "mode": mode,
+                "expectedRevision": expected_revision,
+            },
+        )
+        return result if isinstance(result, dict) else {}
+
     async def usage_status(self) -> dict[str, Any]:
         return cast(dict[str, Any], await self._call("usage.status", {}))
 
@@ -905,17 +938,6 @@ class GatewayClient:
     async def patch_config_safe(self, patches: dict[str, Any]) -> dict[str, Any]:
         result = await self._call("config.patch.safe", {"patches": patches})
         return result if isinstance(result, dict) else {}
-
-    async def forget_approvals(self, target: str | None = None) -> dict[str, Any]:
-        """Wipe cached intent approvals on the server.
-
-        ``target`` selects a specific path/command; omit to clear all.
-        Returns the scope reported by the server.
-        """
-        params: dict[str, Any] = {}
-        if target:
-            params["target"] = target
-        return cast(dict[str, Any], await self._call("exec.approval.forget", params))
 
     async def approvals_snapshot(self) -> dict[str, Any]:
         """Return current approval mode + cache contents (diagnostic)."""
@@ -1097,7 +1119,7 @@ class GatewayClient:
         """Send message and yield session events until done.
 
         ``elevated`` is a legacy surface kept for older clients. ``off``
-        clears the override, ``on``/``bypass`` map to Managed Execution, and
+        clears the override, ``on``/``bypass`` map to Safe mode, and
         ``full`` maps to Full Host Access.
         """
         # Register the local queue before send. Replay/live frames are broadcast
@@ -1289,6 +1311,16 @@ def _advance_gateway_turn_event(
         payload = _normalize_session_error_payload(payload)
     if task_terminal := _task_terminal_as_session_event(event_name, payload):
         return task_terminal, not active_task_groups
+
+    # A terminal generation reset is already the canonical visible failure.
+    # Stop this turn subscription on that frame so the TaskRuntime's later
+    # task.failed bookkeeping event cannot be projected as a second generic
+    # session.error that overwrites the reset result.
+    if (
+        event_name == "session.event.answer_generation_reset"
+        and payload.get("terminal") is True
+    ):
+        return {"event": event_name, **payload}, True
 
     group_id = payload.get("group_id")
     active_group_event = event_name in {

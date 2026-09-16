@@ -23,7 +23,11 @@ from opensquilla.search.registry import register_provider
 from opensquilla.search.types import SearchProviderError, SearchProviderSpec, SearchResult
 from opensquilla.session.models import MemoryDurableReceipt
 from opensquilla.session.storage import SessionStorage
-from opensquilla.tools.builtin.web import configure_search, run_web_discover_payload
+from opensquilla.tools.builtin.web import (
+    configure_search,
+    reset_search_runtime,
+    run_web_discover_payload,
+)
 
 
 @dataclass
@@ -89,7 +93,7 @@ def _ctx(**kwargs: Any) -> RpcContext:
 def _reset_search_config():
     configure_search("duckduckgo", max_results=5)
     yield
-    configure_search("duckduckgo", max_results=5)
+    reset_search_runtime()
 
 
 @pytest.mark.asyncio
@@ -173,7 +177,7 @@ def test_sessions_delete_is_write_scope_and_allows_remote_operator():
 
     On the default Docker bind (``OPENSQUILLA_LISTEN=0.0.0.0``) the gateway is not a
     loopback bind, so even a ``127.0.0.1`` peer is not the local owner and is granted
-    only :data:`REMOTE_OPERATOR_SCOPES` (read/write/approvals, no admin). While
+    only :data:`REMOTE_OPERATOR_SCOPES` (read/write, no approvals or admin). While
     ``sessions.delete`` was admin-gated, every such delete failed with
     ``UNAUTHORIZED`` and the UI showed "Failed to delete session". It is now
     write-scoped like its sibling destructive ops (reset/truncate), so a remote
@@ -202,6 +206,32 @@ def test_sessions_delete_is_write_scope_and_allows_remote_operator():
     )
     assert denied is False
     assert missing_admin == ADMIN_SCOPE
+
+
+def test_sessions_rename_is_write_scope_without_weakening_patch():
+    dispatcher = get_dispatcher()
+    rename_entry = dispatcher.get_entry("sessions.rename")
+    patch_entry = dispatcher.get_entry("sessions.patch")
+
+    assert METHOD_SCOPES["sessions.rename"] == WRITE_SCOPE
+    assert rename_entry is not None
+    assert rename_entry.required_scope == WRITE_SCOPE
+    assert authorize_call(
+        "sessions.rename",
+        rename_entry.required_scope,
+        "operator",
+        REMOTE_OPERATOR_SCOPES,
+    ) == (True, None)
+
+    assert METHOD_SCOPES["sessions.patch"] == ADMIN_SCOPE
+    assert patch_entry is not None
+    assert patch_entry.required_scope == ADMIN_SCOPE
+    assert authorize_call(
+        "sessions.patch",
+        patch_entry.required_scope,
+        "operator",
+        REMOTE_OPERATOR_SCOPES,
+    ) == (False, ADMIN_SCOPE)
 
 
 @pytest.mark.asyncio
@@ -1665,6 +1695,44 @@ async def test_search_status_and_query_return_structured_payloads():
     assert query.error is None, query.error
     assert query.payload["ok"] is True
     assert query.payload["results"][0]["snippet"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_search_status_reports_the_precondition_that_denies_query(tmp_path):
+    from opensquilla.sandbox.config import SandboxSettings
+    from opensquilla.sandbox.integration import configure_runtime
+
+    register_provider(
+        "fake_search_ok",
+        FakeSearchProvider,
+        SearchProviderSpec(provider_id="fake_search_ok"),
+    )
+    configure_search("fake_search_ok", max_results=4, diagnostics=True)
+    configure_runtime(
+        SandboxSettings(
+            sandbox=True,
+            security_grading=True,
+            network_default="proxy_allowlist",
+        ),
+        workspace=tmp_path,
+    )
+
+    status = await get_dispatcher().dispatch("r1", "search.status", {}, _ctx())
+    query = await get_dispatcher().dispatch(
+        "r2",
+        "search.query",
+        {"query": "hello", "limit": 2},
+        _ctx(),
+    )
+
+    assert status.error is None, status.error
+    assert status.payload["networkReady"] is False
+    reason = status.payload["networkBlockedReason"]
+    assert "Run Context grants" in reason
+    assert query.error is None, query.error
+    assert query.payload["ok"] is False
+    assert query.payload["error"]["kind"] == "policy_denied"
+    assert query.payload["error"]["message"] == reason
 
 
 @pytest.mark.asyncio

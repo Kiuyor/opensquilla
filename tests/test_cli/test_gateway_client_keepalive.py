@@ -12,9 +12,15 @@ import pytest
 from opensquilla.cli.gateway_client import (
     GatewayClient,
     GatewayRPCError,
+    _advance_gateway_turn_event,
     _normalize_session_error_payload,
     _task_terminal_as_session_event,
     session_history_all,
+)
+from opensquilla.contracts.gateway_transport import (
+    ANSWER_GENERATION_RESET_CAPABILITY,
+    GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
+    GATEWAY_CLIENT_MAX_QUEUE,
 )
 
 _STOP = object()
@@ -62,8 +68,15 @@ async def _wait_for(predicate, *, timeout: float = 1.0) -> None:
         await asyncio.sleep(0.005)
 
 
-def _install_fake_websockets(monkeypatch: pytest.MonkeyPatch, ws: _FakeWebSocket) -> None:
-    async def _connect(url: str) -> _FakeWebSocket:
+def _install_fake_websockets(
+    monkeypatch: pytest.MonkeyPatch,
+    ws: _FakeWebSocket,
+    *,
+    observed_connect: dict[str, Any] | None = None,
+) -> None:
+    async def _connect(url: str, **kwargs: Any) -> _FakeWebSocket:
+        if observed_connect is not None:
+            observed_connect.update({"url": url, **kwargs})
         return ws
 
     monkeypatch.setitem(sys.modules, "websockets", SimpleNamespace(connect=_connect))
@@ -111,6 +124,21 @@ def test_gateway_client_error_normalization_preserves_generic_error_detail() -> 
     assert payload["error_message"] == "Tool failed with exit code 2"
 
 
+def test_terminal_generation_reset_ends_turn_before_task_failed_projection() -> None:
+    reset, terminal = _advance_gateway_turn_event(
+        "session.event.answer_generation_reset",
+        {
+            "terminal": True,
+            "terminal_text_snapshot": "The fixed model could not complete this answer.",
+        },
+        {"still-running-child"},
+    )
+
+    assert terminal is True
+    assert reset["event"] == "session.event.answer_generation_reset"
+    assert reset["terminal"] is True
+
+
 def _handshake_frames(*, keepalive_ms: int = 60_000) -> list[dict[str, Any]]:
     return [
         {"type": "event", "event": "connect.challenge", "payload": {"nonce": "n"}},
@@ -119,6 +147,34 @@ def _handshake_frames(*, keepalive_ms: int = 60_000) -> list[dict[str, Any]]:
             "policy": {"client_ws_keepalive_timeout_ms": keepalive_ms},
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_gateway_client_connect_uses_bounded_transport_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _FakeWebSocket(_handshake_frames())
+    observed_connect: dict[str, Any] = {}
+    _install_fake_websockets(
+        monkeypatch,
+        ws,
+        observed_connect=observed_connect,
+    )
+    client = GatewayClient()
+
+    await client.connect("ws://127.0.0.1:18791/ws")
+    try:
+        assert observed_connect == {
+            "url": "ws://127.0.0.1:18791/ws",
+            "max_size": GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
+            "max_queue": GATEWAY_CLIENT_MAX_QUEUE,
+        }
+        connect_frame = json.loads(ws.sent[0])
+        assert connect_frame["params"]["caps"] == [
+            ANSWER_GENERATION_RESET_CAPABILITY
+        ]
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio
@@ -240,7 +296,7 @@ async def test_call_preserves_gateway_error_details_for_safe_fallback_decisions(
     client._ws = ws  # noqa: SLF001
 
     call_task = asyncio.create_task(
-        client._call("sessions.steer", {"key": "agent:main:x"})  # noqa: SLF001
+        client._call("sessions.steer.v2", {"key": "agent:main:x"})  # noqa: SLF001
     )
     await _wait_for(lambda: bool(ws.sent))
     request_id = json.loads(ws.sent[0])["id"]

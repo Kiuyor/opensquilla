@@ -13,6 +13,7 @@ import pytest
 from opensquilla.engine import runtime as runtime_module
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.runtime import TurnRunner
+from opensquilla.session import compaction as compaction_module
 from opensquilla.session.compaction import CompactionConfig
 from opensquilla.session.models import TranscriptEntry
 
@@ -423,18 +424,29 @@ async def test_t3_within_budget_skips_flush_and_compact() -> None:
 
 
 @pytest.mark.asyncio
-async def test_t3_budget_check_counts_full_tool_call_replay() -> None:
-    from opensquilla.session.compaction import (
-        estimate_entry_model_replay_tokens,
-        estimate_entry_replay_tokens,
-    )
+async def test_t3_budget_check_counts_full_tool_call_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
 
+    monkeypatch.setattr(
+        compaction_module,
+        "_estimate_tokens",
+        lambda text: max(1, len(text) // 4),
+    )
     transcript = _tool_heavy_transcript()
-    window = 30_000
-    summarized = sum(estimate_entry_replay_tokens(e) for e in transcript)
-    model_replay = sum(estimate_entry_model_replay_tokens(e) for e in transcript)
+    summarized = sum(compaction_module.estimate_entry_replay_tokens(e) for e in transcript)
+    model_replay = sum(
+        compaction_module.estimate_entry_model_replay_tokens(e) for e in transcript
+    )
+    # Derive the window from the estimators instead of hard-coding a token
+    # count. This assertion is about WHICH estimator the budget check consults,
+    # not about an incidental absolute token count. The midpoint of the valid
+    # band keeps margin on both sides while deterministic token math keeps the
+    # test offline.
+    safety_margin = 1.2
+    window = int((summarized + model_replay) * safety_margin / 2)
     # The summarized estimate looks within budget while the model replay overflows.
-    assert summarized * 1.2 <= window < model_replay * 1.2
+    assert summarized * safety_margin <= window < model_replay * safety_margin
 
     sm = _FakeSessionManager(transcript)
     fs = _FakeFlushService()
@@ -519,7 +531,7 @@ async def test_t3_stale_preimage_skip_does_not_mark_compacted(
     assert result == "handled"
     assert sm.compact_calls == [(session_key, 100_000)]
     assert runner.has_compacted_this_turn(session_key) is False
-    skipped = [payload for _, payload in events if payload.get("status") == "skipped"]
+    skipped = [payload for _, payload in events if payload.get("status") == "stale"]
     assert skipped[-1]["reason"] == "stale_preimage"
     assert skipped[-1]["applied"] is False
     assert skipped[-1]["durability"] == "none"
@@ -841,14 +853,17 @@ async def test_t3_compact_failure_uses_emergency_ephemeral_history_trim(
         def set_history(self, history: list[Any]) -> None:
             self.history = history
 
+        def set_request_image_context(self, messages: list[Any]) -> None:
+            assert messages == []
+
     agent = _HistoryCapture()
     summary_context = await runner._load_history(agent, session_key, trim_last_user=False)
 
     assert result == "compact_failed"
     assert len(await sm.get_transcript(session_key)) == len(transcript)
-    assert 0 < len(agent.history) < len(transcript)
+    assert len(agent.history) < len(transcript)
     assert summary_context is not None
-    assert "emergency request-scoped compaction" in summary_context.lower()
+    assert "temporary history window" in summary_context.lower()
     statuses = [payload["status"] for _, payload in events]
     assert statuses[:2] == ["started", "emergency_ephemeral"]
     assert "failed" not in statuses
@@ -884,11 +899,23 @@ async def test_t3_open_circuit_still_uses_request_scoped_emergency_trim(
         count=3,
         opened_at=runtime_module.time.monotonic(),
     )
+    from opensquilla.engine import request_window
+
+    selected_windows: list[int] = []
+    original_cuts = request_window.iter_window_prefix_cuts
+
+    def observe_cuts(roles, **kwargs):
+        selected_windows.append(kwargs["protected_start"])
+        return original_cuts(roles, **kwargs)
+
+    monkeypatch.setattr(request_window, "iter_window_prefix_cuts", observe_cuts)
 
     result = await runner._maybe_compact_on_t3_upgrade(
         session_key,
         _make_turn(routed_tier="c3", previous_tier="c2"),
-        1000,
+        10_000,
+        history_capacity_tokens=1_500,
+        history_capacity_chars=5_000,
     )
 
     assert result == "handled"
@@ -898,3 +925,7 @@ async def test_t3_open_circuit_still_uses_request_scoped_emergency_trim(
     assert emergency["reason"] == "durable_compaction_circuit_open"
     assert emergency["durability"] == "request_scoped"
     assert runner._compaction_failures[session_key].count == 3
+    assert selected_windows == [len(transcript) - 2]
+    override = runner._emergency_compaction_overrides[session_key]
+    assert override.history_window_tokens == 1_500
+    assert override.history_capacity_chars == 5_000

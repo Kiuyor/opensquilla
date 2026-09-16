@@ -121,6 +121,7 @@ class SchedulerEngine:
         schedule_kind: ScheduleKind | str,
         schedule_value: str,
         schedule_tz: str = "",
+        enabled: bool = True,
         handler_key: str = "agent_run",
         payload: dict | None = None,
         session_target: SessionTarget = SessionTarget.ISOLATED,
@@ -136,6 +137,7 @@ class SchedulerEngine:
         creator_session_key: str = "",
         creator_sender_id: str = "",
         creator_is_owner: bool = False,
+        creator_host_execute: bool = False,
         run_mode: str = "",
         idempotency_key: str = "",
     ) -> CronJob:
@@ -147,6 +149,7 @@ class SchedulerEngine:
         """
         job = await self._ops.add(
             name=name,
+            enabled=enabled,
             handler_key=handler_key,
             payload=payload,
             session_target=session_target,
@@ -162,6 +165,7 @@ class SchedulerEngine:
             creator_session_key=creator_session_key,
             creator_sender_id=creator_sender_id,
             creator_is_owner=creator_is_owner,
+            creator_host_execute=creator_host_execute,
             run_mode=run_mode,
             idempotency_key=idempotency_key,
             schedule_kind=schedule_kind,

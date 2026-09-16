@@ -1,10 +1,11 @@
 <template>
-  <!-- Prominent outcome banner after the reply is sent -->
+  <!-- Only confirmed answers or expired requests have a terminal outcome. -->
   <div
-    v-if="submitted"
+    v-if="submitted || expired"
     class="clarify-outcome"
     :class="{
       'is-busy': busy,
+      'clarify-outcome--expired': expired,
       'clarify-outcome--plan': isPlanQuestionnaire,
     }"
     data-testid="clarify-outcome"
@@ -13,14 +14,14 @@
     aria-atomic="true"
   >
     <span v-if="!isPlanQuestionnaire" class="clarify-outcome__icon" aria-hidden="true">
-      <Icon :name="busy ? 'clock' : 'check'" :size="18" />
+      <Icon :name="expired ? 'clock' : 'check'" :size="18" />
     </span>
     <span class="clarify-outcome__copy">
       <span class="clarify-outcome__title">
-        {{ busy ? t('chat.clarify.replyReceived') : t('chat.clarify.outcomeDoneTitle') }}
+        {{ expired ? t('chat.clarify.expiredTitle') : t('chat.clarify.outcomeDoneTitle') }}
       </span>
       <span class="clarify-outcome__detail">
-        {{ busy ? t('chat.clarify.outcomeBusyDetail') : t('chat.clarify.outcomeDoneDetail') }}
+        {{ expired ? t('chat.clarify.expiredDetail') : t('chat.clarify.outcomeDoneDetail') }}
       </span>
     </span>
   </div>
@@ -45,15 +46,24 @@
     >{{ t('chat.clarify.inputNeededFromAgent') }}</div>
     <header class="clarify-card__head">
       <span class="clarify-card__eyebrow">{{ t('chat.clarify.inputNeeded') }}</span>
-      <p v-if="request.intro && !isPlanQuestionnaire" class="clarify-card__intro">
-        {{ request.intro }}
-      </p>
+      <p
+        v-if="request.intro && !isPlanQuestionnaire"
+        class="clarify-card__intro"
+        :class="{ 'clarify-card__intro--long': hasLongIntro }"
+        :tabindex="hasLongIntro ? 0 : undefined"
+        data-testid="clarify-intro"
+      >{{ request.intro }}</p>
       <p v-if="isPlanQuestionnaire" class="clarify-card__intro">
         {{ t('chat.clarify.planQuestionnaireHint') }}
       </p>
     </header>
 
-    <div class="clarify-card__body">
+    <div
+      class="clarify-card__body"
+      role="region"
+      tabindex="0"
+      :aria-label="t('chat.clarify.inputNeeded')"
+    >
       <div v-for="field in displayedFields" :key="field.name" class="clarify-field">
         <div :id="fieldLabelId(field.name)" class="clarify-field__label">
           <span class="clarify-field__name">{{ field.header || field.name }}</span>
@@ -260,7 +270,7 @@
         role="status"
         aria-live="polite"
       >
-        {{ t('chat.clarify.sendingContinuing') }}
+        {{ t('chat.clarify.sendingReply') }}
       </p>
       <p v-if="error" class="clarify-card__error" role="alert">{{ error }}</p>
     </footer>
@@ -278,11 +288,13 @@ const { t } = useI18n()
 const props = withDefaults(defineProps<{
   request: ChatClarifyRequest
   submitted?: boolean
+  expired?: boolean
   busy?: boolean
   error?: string
   docked?: boolean
 }>(), {
   submitted: false,
+  expired: false,
   busy: false,
   error: '',
   docked: false,
@@ -294,6 +306,7 @@ const emit = defineEmits<{
 }>()
 
 const values = reactive<Record<string, string>>({})
+const hasLongIntro = computed(() => props.request.intro.length > 2_000)
 const otherValues = reactive<Record<string, string>>({})
 const otherSelected = reactive<Record<string, boolean>>({})
 const activeFieldIndex = ref(0)
@@ -487,6 +500,25 @@ function onSubmit() {
   font-size: var(--fs-sm);
   line-height: 1.5;
   margin: 0;
+}
+
+.clarify-card__intro--long {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  max-block-size: clamp(14rem, 42vh, 28rem);
+  overflow-wrap: anywhere;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: var(--sp-3);
+  scrollbar-gutter: stable;
+  white-space: pre-wrap;
+}
+
+.clarify-card__intro--long:focus-visible {
+  border-color: var(--border-focus);
+  box-shadow: var(--focus-ring);
+  outline: none;
 }
 
 .clarify-card__body {
@@ -857,7 +889,8 @@ function onSubmit() {
 }
 
 .clarify-outcome--plan,
-.clarify-outcome--plan.is-busy {
+.clarify-outcome--plan.is-busy,
+.clarify-outcome--expired {
   gap: var(--sp-2);
   background: var(--bg-surface);
   border-color: var(--border);
@@ -926,6 +959,11 @@ function onSubmit() {
 }
 
 @media (max-width: 768px) {
+  .clarify-card__intro--long {
+    max-block-size: min(45vh, 24rem);
+    padding: var(--sp-2);
+  }
+
   .clarify-card__actions {
     flex-direction: column;
     align-items: stretch;

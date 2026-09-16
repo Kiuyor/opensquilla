@@ -122,8 +122,15 @@ try {
   const page = await app.firstWindow({ timeout: 60_000 })
   await page.waitForLoadState('domcontentloaded', { timeout: 60_000 }).catch(() => {})
   await waitFor(
-    async () => page.url().includes('/control/chat'),
-    'Control UI to load on Chat',
+    async () => page.url().startsWith('opensquilla-app://desktop/chat'),
+    'Desktop renderer to load on Chat',
+    60_000,
+  )
+  await waitFor(
+    async () => (await page.evaluate(
+      () => window.opensquillaDesktop?.getGatewayConnection?.(),
+    ))?.status === 'ready',
+    'Desktop Gateway readiness',
     60_000,
   )
 
@@ -161,30 +168,45 @@ try {
   }, 'mock update downloaded renderer state')
   assert.equal(downloadedState.latestVersion, mockVersion)
 
-  const relaunchLabel = await waitFor(async () => {
-    const labels = await menuLabels(app)
-    return labels.find((label) => relaunchLabels.includes(label))
-  }, 'Relaunch to Update menu item')
-  assert.ok(relaunchLabel, 'pending mock update should expose relaunch menu item')
+  let relaunchEntry
+  if (process.platform === 'darwin') {
+    relaunchEntry = await waitFor(async () => {
+      const labels = await menuLabels(app)
+      return labels.find((label) => relaunchLabels.includes(label))
+    }, 'Relaunch to Update menu item')
+    assert.ok(relaunchEntry, 'pending mock update should expose relaunch menu item')
 
-  const clicked = await clickRelaunchToUpdate(app)
-  assert.equal(clicked, true, 'Relaunch to Update menu item should be clickable')
+    const clicked = await clickRelaunchToUpdate(app)
+    assert.equal(clicked, true, 'Relaunch to Update menu item should be clickable')
+  } else {
+    const relaunchButton = page.locator('[data-testid="desktop-update-relaunch"]')
+    await relaunchButton.waitFor({ state: 'visible', timeout: 30_000 })
+    await relaunchButton.click()
+    relaunchEntry = 'desktop-update-relaunch'
+  }
 
   await delay(500)
   assert.equal(page.isClosed(), false, 'mock install should not quit the app')
-  assert.match(await page.title(), /OpenSquilla/, 'Control UI should remain available after mock install')
+  assert.match(await page.title(), /OpenSquilla/, 'Desktop renderer should remain available after mock install')
 
-  const labelsAfterClick = await menuLabels(app)
-  assert.ok(
-    labelsAfterClick.some((label) => relaunchLabels.includes(label)),
-    'mock install keeps the pending relaunch menu available for repeated inspection',
-  )
+  if (process.platform === 'darwin') {
+    const labelsAfterClick = await menuLabels(app)
+    assert.ok(
+      labelsAfterClick.some((label) => relaunchLabels.includes(label)),
+      'mock install keeps the pending relaunch menu available for repeated inspection',
+    )
+  } else {
+    await page.locator('[data-testid="desktop-update-relaunch"]').waitFor({
+      state: 'visible',
+      timeout: 30_000,
+    })
+  }
 
   console.log(JSON.stringify({
     ok: true,
     version: mockVersion,
     updateState: downloadedState.status,
-    relaunchLabel,
+    relaunchEntry,
     url: page.url(),
     title: await page.title(),
   }, null, 2))

@@ -1,9 +1,9 @@
 """Best-effort provider request/response trace recorder.
 
 The recorder is intentionally side-effect safe: failures to write traces must
-never affect model calls. It records no authorization headers and is enabled by
-environment so external harnesses can keep full diagnostics without changing
-provider behavior.
+never affect model calls. It records no authorization headers or upstream error
+prose and is enabled by environment so external harnesses can keep bounded
+diagnostics without changing provider behavior.
 """
 
 from __future__ import annotations
@@ -157,6 +157,23 @@ class LLMTraceRecorder:
             }
         )
 
+    def record_response_headers(
+        self,
+        *,
+        response_ids: list[str] | None = None,
+    ) -> None:
+        """Record response identity without retaining arbitrary HTTP headers."""
+
+        safe_ids = _redact(response_ids or [])
+        if not safe_ids:
+            return
+        self._append(
+            {
+                "event": "llm.response_headers",
+                "response_ids": safe_ids,
+            }
+        )
+
     def record_response(
         self,
         *,
@@ -195,13 +212,49 @@ class LLMTraceRecorder:
         response_body: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
+        """Record bounded error diagnostics without retaining upstream prose.
+
+        Provider error messages and response bodies are untrusted and can echo
+        prompts, generated text, credentials, or provider-internal details.
+        Preserve their sizes for diagnostics, but never persist their content
+        in the normal trace record.
+        """
+
+        normalized_code = str(code or "").strip().lower().replace("-", "_")
+        safe_codes = {
+            "cancelled",
+            "empty_response",
+            "incomplete_stream",
+            "incomplete_tool_call",
+            "incomplete_tool_stream",
+            "invalid_json",
+            "invalid_response",
+            "invalid_stream_frame",
+            "invalid_stream_order",
+            "provider_protocol_error",
+            "provider_pretext_buffer_exhausted",
+            "request_error",
+            "timeout",
+        }
+        safe_code = (
+            str(status_code)
+            if status_code is not None
+            else normalized_code
+            if normalized_code in safe_codes
+            else "provider_error"
+        )
         self._append(
             {
                 "event": "llm.error",
-                "code": _redact(code),
-                "message": _redact(message),
+                "code": safe_code,
+                "code_chars": len(code or ""),
+                "message": "Provider request failed",
+                "message_chars": len(message),
                 "status_code": status_code,
-                "response_body": _redact(response_body),
+                # Keep the legacy field for trace-schema compatibility while
+                # enforcing the no-upstream-body storage boundary.
+                "response_body": None,
+                "response_body_chars": len(response_body or ""),
                 "metadata": _redact(metadata or {}),
             }
         )

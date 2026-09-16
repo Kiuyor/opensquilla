@@ -646,23 +646,6 @@ async def test_preflight_legacy_compactor_uses_id_safe_ephemeral_override(
         return "unsafe durable summary"
 
     manager.compact = AsyncMock(side_effect=legacy_compact)
-    emergency_requests: list[Any] = []
-
-    async def emergency_compact(request: Any) -> SimpleNamespace:
-        emergency_requests.append(request)
-        return SimpleNamespace(
-            summary="safe request-only summary",
-            kept_entries=request.entries[2:],
-            removed_count=2,
-            chunks_processed=1,
-            tokens_before=1220,
-            tokens_after=20,
-        )
-
-    monkeypatch.setattr(
-        "opensquilla.session.compaction.compact_context",
-        emergency_compact,
-    )
     runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager)
 
     await runner._maybe_preflight_compact(
@@ -673,8 +656,11 @@ async def test_preflight_legacy_compactor_uses_id_safe_ephemeral_override(
     )
 
     assert durable_calls == []
-    assert len(emergency_requests) == 1
-    assert emergency_requests[0].config.protected_recent_messages == 2
+    override = runner._emergency_compaction_overrides[session_key]
+    assert override.protected_recent_messages == 2
+    assert [entry.message_id for entry in override.kept_entries] == [
+        active_user.message_id, queued_user.message_id,
+    ]
 
     class _HistoryCapture:
         provider = SimpleNamespace(provider_name="test")
@@ -684,6 +670,9 @@ async def test_preflight_legacy_compactor_uses_id_safe_ephemeral_override(
 
         def set_history(self, history: list[Any]) -> None:
             self.history = history
+
+        def set_request_image_context(self, messages: list[Any]) -> None:
+            assert messages == []
 
     agent = _HistoryCapture()
     summary_context = await runner._load_history(
@@ -695,7 +684,8 @@ async def test_preflight_legacy_compactor_uses_id_safe_ephemeral_override(
 
     assert agent.history == []
     assert summary_context is not None
-    assert "safe request-only summary" in summary_context
+    assert "Temporary history window" in summary_context
+    assert "old user" not in summary_context
 
 
 @pytest.mark.asyncio
@@ -1178,14 +1168,17 @@ async def test_preflight_compact_failure_uses_emergency_ephemeral_history_trim()
         def set_history(self, history: list[Any]) -> None:
             self.history = history
 
+        def set_request_image_context(self, messages: list[Any]) -> None:
+            assert messages == []
+
     agent = _HistoryCapture()
     summary_context = await runner._load_history(agent, session_key, trim_last_user=False)
 
     _assert_armed_compaction_call(sm.compact_with_result_calls, session_key, context_window)
     assert len(await sm.get_transcript(session_key)) == len(entries)
-    assert 0 < len(agent.history) < len(entries)
+    assert len(agent.history) < len(entries)
     assert summary_context is not None
-    assert "emergency request-scoped compaction" in summary_context.lower()
+    assert "temporary history window" in summary_context.lower()
 
 
 @pytest.mark.asyncio
@@ -1232,7 +1225,9 @@ async def test_preflight_open_circuit_still_uses_request_scoped_emergency_trim(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session_key = "agent:ops:preflight-open-circuit"
-    context_window = 1000
+    context_window = 10_000
+    history_capacity = 1_500
+    history_capacity_chars = 5_000
     entries = [
         TranscriptEntry(
             session_id="test-session-id",
@@ -1257,8 +1252,23 @@ async def test_preflight_open_circuit_still_uses_request_scoped_emergency_trim(
         count=3,
         opened_at=runtime_module.time.monotonic(),
     )
+    from opensquilla.engine import request_window
 
-    await runner._maybe_preflight_compact(session_key, context_window)
+    selected_windows: list[int] = []
+    original_cuts = request_window.iter_window_prefix_cuts
+
+    def observe_cuts(roles, **kwargs):
+        selected_windows.append(kwargs["protected_start"])
+        return original_cuts(roles, **kwargs)
+
+    monkeypatch.setattr(request_window, "iter_window_prefix_cuts", observe_cuts)
+
+    await runner._maybe_preflight_compact(
+        session_key,
+        context_window,
+        history_capacity_tokens=history_capacity,
+        history_capacity_chars=history_capacity_chars,
+    )
 
     mock_sm.compact.assert_not_awaited()
     assert [payload["status"] for _, payload in events] == ["emergency_ephemeral"]
@@ -1267,6 +1277,10 @@ async def test_preflight_open_circuit_still_uses_request_scoped_emergency_trim(
     assert emergency["applied"] is True
     assert emergency["durability"] == "request_scoped"
     assert runner._compaction_failures[session_key].count == 3
+    assert selected_windows == [len(entries) - 2]
+    override = runner._emergency_compaction_overrides[session_key]
+    assert override.history_window_tokens == history_capacity
+    assert override.history_capacity_chars == history_capacity_chars
 
 
 @pytest.mark.asyncio
@@ -1319,14 +1333,17 @@ async def test_preflight_empty_summary_uses_emergency_ephemeral_history_trim() -
         def set_history(self, history: list[Any]) -> None:
             self.history = history
 
+        def set_request_image_context(self, messages: list[Any]) -> None:
+            assert messages == []
+
     agent = _HistoryCapture()
     summary_context = await runner._load_history(agent, session_key, trim_last_user=False)
 
     _assert_armed_compaction_call(sm.compact_with_result_calls, session_key, context_window)
     assert len(await sm.get_transcript(session_key)) == len(entries)
-    assert 0 < len(agent.history) < len(entries)
+    assert len(agent.history) < len(entries)
     assert summary_context is not None
-    assert "emergency request-scoped compaction" in summary_context.lower()
+    assert "temporary history window" in summary_context.lower()
 
 
 @pytest.mark.asyncio
@@ -1360,7 +1377,7 @@ async def test_preflight_stale_preimage_skip_does_not_use_emergency_trim(
     _assert_armed_compaction_call(sm.compact_with_result_calls, session_key, context_window)
     assert runner.has_compacted_this_turn(session_key) is False
     assert runner._compaction_failures[session_key].count == 1
-    skipped = [payload for _, payload in events if payload.get("status") == "skipped"]
+    skipped = [payload for _, payload in events if payload.get("status") == "stale"]
     assert skipped[-1]["reason"] == "stale_preimage"
     assert skipped[-1]["applied"] is False
     assert skipped[-1]["durability"] == "none"
@@ -1374,6 +1391,9 @@ async def test_preflight_stale_preimage_skip_does_not_use_emergency_trim(
 
         def set_history(self, history: list[Any]) -> None:
             self.history = history
+
+        def set_request_image_context(self, messages: list[Any]) -> None:
+            assert messages == []
 
     agent = _HistoryCapture()
     summary_context = await runner._load_history(agent, session_key, trim_last_user=False)

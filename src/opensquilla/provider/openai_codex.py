@@ -4,7 +4,8 @@ Speaks the ``chatgpt.com/backend-api/codex/responses`` protocol — an OpenAI
 Responses-flavored SSE endpoint authenticated with the operator's ChatGPT
 subscription (Bearer access token + ``chatgpt-account-id`` header) instead
 of a platform API key. Credentials come from the Codex CLI's auth file via
-``codex_auth``; a 401 triggers one token refresh + retry.
+``codex_auth``; legacy unbounded calls may refresh once and retry on a 401,
+while coordinator-bound calls surface the failure without an adapter resend.
 
 Wire facts mirror the reference implementation in codex-rs: flat function
 tools (``{type, name, description, strict, parameters}``), Responses input
@@ -33,6 +34,7 @@ from .codex_auth import (
     refresh_codex_credentials,
 )
 from .error_redaction import redact_upstream_error_code, redact_upstream_error_text
+from .failures import CONNECTION_FAILED_CODE, is_connection_failure, retry_after_from_headers
 from .openai import _http_error_body_text, _resolve_llm_proxy
 from .openai_responses import _responses_input
 from .protocol import ProviderConnectionConfig, ProviderMetadata
@@ -342,6 +344,11 @@ class OpenAICodexProvider:
             )
             return
 
+        # A coordinator-issued physical attempt owns its retry decision.  Do
+        # not refresh credentials and resend from inside that attempt; the
+        # legacy direct-call path keeps its historical one-refresh
+        # compatibility behavior.
+        coordinator_owns_retry = cfg.physical_attempt_limit == 1
         try:
             async with httpx.AsyncClient(
                 timeout=cfg.timeout,
@@ -359,7 +366,7 @@ class OpenAICodexProvider:
                         if (
                             response.status_code == 401
                             and not refreshed
-                            and cfg.physical_attempt_limit != 1
+                            and not coordinator_owns_retry
                         ):
                             refreshed = True
                             try:
@@ -383,6 +390,9 @@ class OpenAICodexProvider:
                                     max_len=2000,
                                 ),
                                 code=str(response.status_code),
+                                retry_after_s=retry_after_from_headers(
+                                    response.status_code, getattr(response, "headers", None)
+                                ),
                             )
                             return
 
@@ -400,7 +410,7 @@ class OpenAICodexProvider:
                     api_key=credentials.access_token,
                     max_len=2000,
                 ),
-                code="timeout",
+                code=CONNECTION_FAILED_CODE if is_connection_failure(exc) else "timeout",
             )
         except httpx.RequestError as exc:
             yield ErrorEvent(
@@ -409,7 +419,7 @@ class OpenAICodexProvider:
                     api_key=credentials.access_token,
                     max_len=2000,
                 ),
-                code="request_error",
+                code=CONNECTION_FAILED_CODE if is_connection_failure(exc) else "request_error",
             )
         except CandidateArtifactLimitError as exc:
             log.warning(
@@ -426,10 +436,11 @@ class OpenAICodexProvider:
                 code="candidate_artifact_limit_exceeded",
             )
         except Exception as exc:  # noqa: BLE001 - chat() contract: ErrorEvent instead of raising
-            log.exception(
+            log.error(
                 "provider.stream_internal_error",
                 provider=self.provider_name,
                 model=self._model,
+                exception_type=type(exc).__name__,
             )
             yield ErrorEvent(
                 message=redact_upstream_error_text(
@@ -916,7 +927,7 @@ class OpenAICodexProvider:
     async def list_models(self) -> list[ModelInfo]:
         return [
             ModelInfo(
-                provider=self.provider_name,
+                provider=self.provider_id,
                 model_id=model_id,
                 display_name=display_name,
                 context_window=272_000,

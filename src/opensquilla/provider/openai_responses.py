@@ -28,7 +28,7 @@ from .error_redaction import (
     redact_upstream_error_text,
     redacted_httpx_error,
 )
-from .failures import retry_after_from_headers
+from .failures import CONNECTION_FAILED_CODE, is_connection_failure, retry_after_from_headers
 from .openai import _http_error_body_text, _resolve_llm_proxy, _versioned_api_url
 from .protocol import ProviderConnectionConfig, ProviderMetadata
 from .request_proof import (
@@ -53,6 +53,7 @@ from .types import (
     StreamEvent,
     TextDeltaEvent,
     ToolDefinition,
+    ToolUseStartEvent,
 )
 
 _OPENAI_RESPONSES_BASE = "https://api.openai.com/v1"
@@ -440,22 +441,24 @@ class OpenAIResponsesProvider:
                     json=payload,
                 )
         except httpx.TimeoutException as exc:
+            code = CONNECTION_FAILED_CODE if is_connection_failure(exc) else "timeout"
             message = redact_upstream_error_text(
                 f"Request timed out: {str(exc) or repr(exc)}",
                 api_key=self._api_key,
                 max_len=2000,
             )
-            trace.record_error(code="timeout", message=message)
-            yield ErrorEvent(message=message, code="timeout")
+            trace.record_error(code=code, message=message)
+            yield ErrorEvent(message=message, code=code)
             return
         except httpx.RequestError as exc:
+            code = CONNECTION_FAILED_CODE if is_connection_failure(exc) else "request_error"
             message = redact_upstream_error_text(
                 f"Request error: {str(exc) or repr(exc)}",
                 api_key=self._api_key,
                 max_len=2000,
             )
-            trace.record_error(code="request_error", message=message)
-            yield ErrorEvent(message=message, code="request_error")
+            trace.record_error(code=code, message=message)
+            yield ErrorEvent(message=message, code=code)
             return
 
         if response.status_code != 200:
@@ -556,6 +559,8 @@ class OpenAIResponsesProvider:
             int,
             tuple[str, str, str, str, dict[str, Any]],
         ] = {}
+        recognized_tool_starts: dict[int, list[ToolUseStartEvent]] = {}
+        recognized_tools_acc = ToolStreamAccumulator()
         validated_message_text: dict[int, list[str]] = {}
         invalid_tool_call_count = 0
         invalid_output_shape = False
@@ -663,6 +668,24 @@ class OpenAIResponsesProvider:
             if not isinstance(tool_name, str) or not tool_name.strip():
                 invalid_tool_call_count += 1
                 continue
+            call_id = raw_call_id or raw_item_id or f"call_{uuid4().hex[:12]}"
+            key = raw_item_id or call_id
+            try:
+                recognized_tool_starts[item_index] = [
+                    event
+                    for event in recognized_tools_acc.start(
+                        key,
+                        tool_use_id=call_id,
+                        tool_name=tool_name,
+                    )
+                    if isinstance(event, ToolUseStartEvent)
+                ]
+            except ToolStreamProtocolError:
+                # An invalid or oversized identity is not executable enough to
+                # reserve. Keep it on the terminal incomplete-call path without
+                # exposing a synthetic lifecycle.
+                invalid_tool_call_count += 1
+                continue
             raw_arguments = item.get("arguments")
             if raw_arguments is None:
                 raw_arguments = ""
@@ -696,8 +719,6 @@ class OpenAIResponsesProvider:
             except (RecursionError, TypeError, ValueError):
                 invalid_tool_call_count += 1
                 continue
-            call_id = raw_call_id or raw_item_id or f"call_{uuid4().hex[:12]}"
-            key = raw_item_id or call_id
             parsed_tool_arguments[item_index] = (
                 call_id,
                 key,
@@ -730,6 +751,8 @@ class OpenAIResponsesProvider:
             for item_index in range(len(output_items)):
                 for text in validated_message_text.get(item_index, []):
                     yield TextDeltaEvent(text=text)
+                for start_event in recognized_tool_starts.get(item_index, []):
+                    yield start_event
             yield ErrorEvent(message=message, code="incomplete_tool_call")
             return
 
@@ -947,7 +970,7 @@ class OpenAIResponsesProvider:
             if isinstance(model_id, str):
                 models.append(
                     ModelInfo(
-                        provider=self.provider_name,
+                        provider=self.provider_id,
                         model_id=model_id,
                         display_name=raw.get("name") or model_id,
                     )

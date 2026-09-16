@@ -153,7 +153,6 @@ from opensquilla.cli.sandbox_cmd import sandbox_app  # noqa: E402
 from opensquilla.cli.search_cmd import search_app  # noqa: E402
 from opensquilla.cli.sessions_cmd import app as sessions_app  # noqa: E402
 from opensquilla.cli.skills_cmd import skills_app  # noqa: E402
-from opensquilla.cli.swebench_cmd import swebench_app  # noqa: E402
 from opensquilla.cli.uninstall_cmd import uninstall_command  # noqa: E402
 from opensquilla.observability.cli_logging import configure_cli_structlog  # noqa: E402
 
@@ -203,7 +202,6 @@ app.add_typer(sandbox_app, name="sandbox")
 app.add_typer(search_app, name="search")
 app.add_typer(sessions_app, name="sessions")
 app.add_typer(skills_app, name="skills")
-app.add_typer(swebench_app, name="swebench")
 app.add_typer(codetask_app, name="code-task")
 
 app.command("init")(init_command)
@@ -700,6 +698,9 @@ def gateway_run(
         None,
         "--port",
         "-p",
+        min=0,
+        max=65535,
+        metavar="PORT",
         help="Port to bind (default: config port, usually 18791)",
     ),
     bind: str | None = typer.Option(
@@ -774,6 +775,7 @@ def gateway_start(
         None,
         "--port",
         "-p",
+        metavar="PORT",
         help="Port to bind (default: config port, usually 18791)",
     ),
     bind: str | None = typer.Option(
@@ -806,6 +808,7 @@ def gateway_status(
         None,
         "--port",
         "-p",
+        metavar="PORT",
         help="Port to inspect (default: config port, usually 18791)",
     ),
     bind: str | None = typer.Option(
@@ -842,6 +845,7 @@ def gateway_stop(
         None,
         "--port",
         "-p",
+        metavar="PORT",
         help="Port to stop (default: config port, usually 18791)",
     ),
     bind: str | None = typer.Option(
@@ -874,6 +878,7 @@ def gateway_restart(
         None,
         "--port",
         "-p",
+        metavar="PORT",
         help="Port to restart (default: config port, usually 18791)",
     ),
     bind: str | None = typer.Option(
@@ -982,12 +987,14 @@ def agent(
     iteration_timeout_seconds: float | None = typer.Option(
         None,
         "--iteration-timeout-seconds",
-        help="Per-iteration timeout in seconds (one LLM call + its tool executions)",
+        help="Deprecated compatibility option; ignored.",
+        hidden=True,
     ),
     tool_timeout_seconds: float | None = typer.Option(
         None,
         "--tool-timeout-seconds",
-        help="Per-tool execution timeout in seconds",
+        help="Deprecated compatibility option; ignored.",
+        hidden=True,
     ),
     request_timeout_seconds: float | None = typer.Option(
         None,
@@ -1015,6 +1022,11 @@ def agent(
         "", "--transcript-path", help="Write benchmark-compatible JSONL transcript"
     ),
     usage_path: str = typer.Option("", "--usage-path", help="Write usage JSON to this file"),
+    event_stream_stderr: bool = typer.Option(
+        False,
+        "--event-stream-stderr",
+        help="Write stable v1 progress event JSONL to stderr",
+    ),
     session_db_path: str = typer.Option(
         ":memory:",
         "--session-db-path",
@@ -1065,39 +1077,55 @@ def agent(
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ) -> None:
     """Run a single agent turn for automation."""
-    from opensquilla.recovery import guarded_desktop_profile
+    from opensquilla.cli.output import emit_error
+    from opensquilla.recovery import ProfileLockBusyError, guarded_desktop_profile
 
-    with guarded_desktop_profile():
-        run_agent_command(
-            message=message,
-            agent_id=agent_id,
-            session_id=session_id,
-            model=model,
-            workspace=workspace,
-            workspace_strict=workspace_strict,
-            workspace_lockdown=workspace_lockdown,
-            workspace_lockdown_deny_paths=workspace_lockdown_deny_paths,
-            scratch_dir=scratch_dir,
-            thinking=thinking,
-            timeout=timeout,
-            max_iterations=max_iterations,
-            iteration_timeout_seconds=iteration_timeout_seconds,
-            tool_timeout_seconds=tool_timeout_seconds,
-            request_timeout_seconds=request_timeout_seconds,
-            max_provider_retries=max_provider_retries,
-            length_capped_continuations=length_capped_continuations,
-            transcript_path=transcript_path,
-            usage_path=usage_path,
-            session_db_path=session_db_path,
-            no_memory_capture=no_memory_capture,
-            file_paths=file_paths,
-            unattended=unattended,
-            stateless=stateless,
-            clean_room=clean_room,
-            stateless_keep_project_rules=stateless_keep_project_rules,
-            permissions=permissions,
+    try:
+        with guarded_desktop_profile():
+            run_agent_command(
+                message=message,
+                agent_id=agent_id,
+                session_id=session_id,
+                model=model,
+                workspace=workspace,
+                workspace_strict=workspace_strict,
+                workspace_lockdown=workspace_lockdown,
+                workspace_lockdown_deny_paths=workspace_lockdown_deny_paths,
+                scratch_dir=scratch_dir,
+                thinking=thinking,
+                timeout=timeout,
+                max_iterations=max_iterations,
+                iteration_timeout_seconds=iteration_timeout_seconds,
+                tool_timeout_seconds=tool_timeout_seconds,
+                request_timeout_seconds=request_timeout_seconds,
+                max_provider_retries=max_provider_retries,
+                length_capped_continuations=length_capped_continuations,
+                transcript_path=transcript_path,
+                usage_path=usage_path,
+                event_stream_stderr=event_stream_stderr,
+                session_db_path=session_db_path,
+                no_memory_capture=no_memory_capture,
+                file_paths=file_paths,
+                unattended=unattended,
+                stateless=stateless,
+                clean_room=clean_room,
+                stateless_keep_project_rules=stateless_keep_project_rules,
+                permissions=permissions,
+                json_output=json_output,
+            )
+    except ProfileLockBusyError:
+        emit_error(
+            "This profile is already in use by another OpenSquilla writer. "
+            "The standalone 'opensquilla agent' command cannot share a profile with "
+            "another writer, including an active Desktop Gateway. To use a running "
+            "Gateway, use a Gateway-backed command such as 'opensquilla chat' (set "
+            "OPENSQUILLA_GATEWAY_URL and OPENSQUILLA_GATEWAY_TOKEN when needed); "
+            "otherwise, set both OPENSQUILLA_STATE_DIR and "
+            "OPENSQUILLA_GATEWAY_STATE_DIR to isolated directories for this agent run.",
             json_output=json_output,
+            code="profile_lock_busy",
         )
+        raise typer.Exit(code=1) from None
 
 
 @app.command("chat")
@@ -1154,8 +1182,14 @@ def chat(
 @app.command("reset")
 def reset_cmd(
     key: str = typer.Option(..., "--key", help="Session key to reset."),
-    gateway_url: str = typer.Option(
-        "http://localhost:18791", "--gateway", envvar="OPENSQUILLA_GATEWAY_URL"
+    gateway_url: str | None = typer.Option(
+        None,
+        "--gateway",
+        envvar="OPENSQUILLA_GATEWAY_URL",
+        help=(
+            "Gateway to reset against. Defaults to the selected profile's "
+            "configured gateway, or ws://localhost:18791/ws when none is configured."
+        ),
     ),
 ) -> None:
     """Reset a session, flushing its memory synchronously.
@@ -1166,12 +1200,21 @@ def reset_cmd(
     import asyncio
 
     from opensquilla.cli.gateway_client import GatewayClient, GatewayRPCError
+    from opensquilla.cli.gateway_rpc import default_gateway_url
     from opensquilla.cli.url_utils import normalize_gateway_url
+
+    # Explicit `--gateway` and `OPENSQUILLA_GATEWAY_URL` both arrive here as a
+    # value, so they keep outranking everything, exactly as before. What the
+    # literal default used to swallow is the step below it: the gateway the
+    # selected profile actually configured. `reset` mutates session state, so
+    # aiming it at the wrong gateway is not a lookup that fails — it flushes
+    # and rotates whatever session key matches on 127.0.0.1:18791.
+    target_url = normalize_gateway_url(gateway_url) if gateway_url else default_gateway_url()
 
     async def _go():
         client = GatewayClient()
         try:
-            await client.connect(normalize_gateway_url(gateway_url))
+            await client.connect(target_url)
             return await client.reset_session(key)
         finally:
             await client.close()

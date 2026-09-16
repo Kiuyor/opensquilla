@@ -16,8 +16,16 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
+from opensquilla.process_tree import (
+    capture_process_tree_owner,
+    create_owned_subprocess_exec,
+)
 from opensquilla.sandbox.denial_attribution import is_likely_sandbox_denied
-from opensquilla.sandbox.elevation import ElevationAction, gate_elevated_action
+from opensquilla.sandbox.elevation import (
+    ApprovalDisplay,
+    ElevationAction,
+    gate_elevated_action,
+)
 from opensquilla.sandbox.integration import (
     SandboxRuntime,
     consume_backend_denial_retry,
@@ -27,6 +35,7 @@ from opensquilla.sandbox.integration import (
     get_runtime,
     preflight_subprocess_managed_network,
     prepare_subprocess_managed_network_proxy,
+    reject_windows_guest_process,
     run_under_backend,
 )
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
@@ -36,9 +45,11 @@ from opensquilla.sandbox.types import (
     DenialResult,
     NetworkMode,
     SandboxBackendError,
+    SandboxPolicy,
     SandboxRequest,
 )
-from opensquilla.subprocess_encoding import apply_utf8_child_env, decode_subprocess_output
+from opensquilla.subprocess_encoding import apply_utf8_child_env
+from opensquilla.tools.output_capture import BoundedOutputCapture
 from opensquilla.tools.registry import tool
 from opensquilla.tools.run_mode import full_host_access_active, trusted_sandbox_active
 from opensquilla.tools.types import ToolError, current_tool_context
@@ -47,6 +58,7 @@ from opensquilla.tools.write_tracking import (
     mutation_ledger_text_hash,
     record_observed_workspace_mutations,
     snapshot_current_workspace_mutations,
+    workspace_write_deny_effect_preflight,
 )
 
 # Destructive Python patterns that must be surfaced to the unified sandbox gate.
@@ -694,6 +706,7 @@ def _code_elevation_action(
         content_length=len(code),
         risk_markers=risk_markers,
         prefix_rule=tuple(prefix_rule) if prefix_rule is not None else None,
+        display=ApprovalDisplay(kind="run_code", target=str(workdir)),
     )
 
 
@@ -703,7 +716,10 @@ def _windows_sandbox_backend_active(runtime: object | None) -> bool:
     return backend_name.startswith("windows_")
 
 
-def _trusted_managed_network_policy(policy, runtime: object | None):
+def _trusted_managed_network_policy(
+    policy: SandboxPolicy,
+    runtime: object | None,
+) -> SandboxPolicy:
     if getattr(policy, "network", None) is NetworkMode.PROXY_ALLOWLIST:
         return policy
     settings = getattr(runtime, "settings", None) if runtime is not None else None
@@ -715,6 +731,8 @@ def _trusted_managed_network_policy(policy, runtime: object | None):
     if getattr(policy, "network", None) is NetworkMode.NONE and (
         ctx is None or getattr(ctx, "sandbox_run_context", None) is None
     ):
+        return policy
+    if not isinstance(policy, SandboxPolicy):
         return policy
     return dataclasses.replace(policy, network=NetworkMode.PROXY_ALLOWLIST, network_proxy=None)
 
@@ -761,6 +779,7 @@ def _unsupported_windows_environment_subprocess_payload(reason: str) -> str:
 
 _MAX_TIMEOUT = 120
 _DEFAULT_TIMEOUT = 30
+_EXECUTION_TIMEOUT_PADDING = 5.0
 _MAX_OUTPUT_CHARS = 50_000
 _SANDBOX_PYTHON_CANDIDATES: tuple[Path, ...] = (
     Path("/usr/bin/python3"),
@@ -814,17 +833,26 @@ def _execution_result_json(
     stderr: str,
     timed_out: bool,
     elapsed_ms: int,
+    capture: BoundedOutputCapture | None = None,
 ) -> str:
-    return json.dumps(
-        {
-            "exit_code": returncode,
-            "stdout": stdout[:_MAX_OUTPUT_CHARS],
-            "stderr": stderr[:_MAX_OUTPUT_CHARS],
-            "timed_out": timed_out,
-            "elapsed_ms": elapsed_ms,
-        },
-        ensure_ascii=False,
-    )
+    def preview(text: str) -> str:
+        if len(text) <= _MAX_OUTPUT_CHARS:
+            return text
+        half = _MAX_OUTPUT_CHARS // 2
+        return text[:half] + "\n[output preview omitted characters]\n" + text[-half:]
+
+    payload = {
+        "exit_code": returncode,
+        "stdout": preview(stdout),
+        "stderr": preview(stderr),
+        "timed_out": timed_out,
+        "elapsed_ms": elapsed_ms,
+    }
+    if capture is not None:
+        truncated = len(stdout) > _MAX_OUTPUT_CHARS or len(stderr) > _MAX_OUTPUT_CHARS
+        if output_details := capture.describe(only_if_needed=not truncated):
+            payload["output_capture"] = output_details
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _append_code_exec_sandbox_network_hint(*, stdout: str, stderr: str) -> str:
@@ -908,6 +936,9 @@ def _resolve_python_bin(*, sandbox_enabled: bool) -> str:
         },
     },
     required=["code"],
+    execution_timeout_seconds=_DEFAULT_TIMEOUT + _EXECUTION_TIMEOUT_PADDING,
+    execution_timeout_argument="timeout",
+    execution_timeout_padding=_EXECUTION_TIMEOUT_PADDING,
     runtime_only_arguments=("approval_id",),
     sandbox=SandboxToolDescriptor.process(
         kind="code.exec",
@@ -926,6 +957,9 @@ async def execute_code(
 ) -> str:
     if not code.strip():
         raise ToolError("Code must not be empty")
+
+    runtime = get_runtime()
+    reject_windows_guest_process(runtime)
 
     full_host = full_host_access_active()
     external_transfer = None if full_host else _check_code_sensitive_external_transfer(code)
@@ -963,7 +997,6 @@ async def execute_code(
     timeout = max(1.0, min(float(timeout), _MAX_TIMEOUT))
 
     ctx = current_tool_context.get()
-    runtime = get_runtime()
     from opensquilla.tools.builtin.shell import (
         _apply_windows_session_tmp_env,
         _host_execution_allowed,
@@ -1050,13 +1083,24 @@ async def execute_code(
         )
     )
     mutation_before = snapshot_current_workspace_mutations()
+    if not full_host:
+        protection_block = workspace_write_deny_effect_preflight(
+            tool_name="execute_code",
+            before=mutation_before,
+        )
+        if protection_block is not None:
+            return protection_block
 
-    def finish(output: str) -> str:
+    def finish(output: str, *, executed: bool = True) -> str:
+        if not executed:
+            return output
         record_observed_workspace_mutations(
             tool_name="execute_code",
             before=mutation_before,
             metadata={"code_hash": mutation_ledger_text_hash(code)},
         )
+        if full_host:
+            return output
         # Effect enforcement runs after the ledger so the raw escape stays
         # honestly recorded before any revert rewrites the workspace.
         return enforce_workspace_write_deny_effects(
@@ -1076,7 +1120,7 @@ async def execute_code(
             hints=hints,
         )
         if isinstance(decision, DenialResult):
-            return finish(json.dumps(decision.to_dict()))
+            return finish(json.dumps(decision.to_dict()), executed=False)
         if isinstance(decision, ApprovedHostExecution):
             host_execution = True
             sandbox_enabled = False
@@ -1090,7 +1134,10 @@ async def execute_code(
             )
             if retry_gate is not None:
                 if not retry_gate.allowed:
-                    return finish(json.dumps(retry_gate.to_envelope(), ensure_ascii=False))
+                    return finish(
+                        json.dumps(retry_gate.to_envelope(), ensure_ascii=False),
+                        executed=False,
+                    )
                 host_execution = True
                 sandbox_enabled = False
                 elevated_code_execution = True
@@ -1100,7 +1147,7 @@ async def execute_code(
                     cwd=request.cwd,
                     action_kind=request.action_kind,
                     policy=_trusted_managed_network_policy(request.policy, runtime),
-                    env=safe_env,
+                    env=dict(getattr(request, "env", None) or safe_env),
                     reason=getattr(request, "reason", ""),
                     session_id=getattr(request, "session_id", ""),
                     run_mode=getattr(request, "run_mode", ""),
@@ -1108,9 +1155,9 @@ async def execute_code(
                 if runtime is not None:
                     preflight = await preflight_subprocess_managed_network(backend_request, runtime)
                     if isinstance(preflight, DenialResult):
-                        return finish(json.dumps(preflight.to_dict()))
+                        return finish(json.dumps(preflight.to_dict()), executed=False)
                     if isinstance(preflight, dict):
-                        return finish(json.dumps(preflight))
+                        return finish(json.dumps(preflight), executed=False)
                 try:
                     sandbox_result = await _run_backend_with_managed_network_if_needed(
                         backend_request,
@@ -1135,8 +1182,14 @@ async def execute_code(
                     )
                     if escalation is not None:
                         if isinstance(escalation, DenialResult):
-                            return finish(json.dumps(escalation.to_dict(), ensure_ascii=False))
-                        return finish(json.dumps(escalation.to_envelope(), ensure_ascii=False))
+                            return finish(
+                                json.dumps(escalation.to_dict(), ensure_ascii=False),
+                                executed=False,
+                            )
+                        return finish(
+                            json.dumps(escalation.to_envelope(), ensure_ascii=False),
+                            executed=False,
+                        )
                     return finish(
                         _execution_result_json(
                             returncode=-1,
@@ -1144,7 +1197,8 @@ async def execute_code(
                             stderr=f"Execution error: {exc}",
                             timed_out=False,
                             elapsed_ms=0,
-                        )
+                        ),
+                        executed=False,
                     )
                 except Exception as exc:
                     return finish(
@@ -1154,7 +1208,8 @@ async def execute_code(
                             stderr=f"Execution error: {exc}",
                             timed_out=False,
                             elapsed_ms=0,
-                        )
+                        ),
+                        executed=False,
                     )
                 if is_likely_sandbox_denied(sandbox_result):
                     review_action = _code_elevation_action(
@@ -1188,55 +1243,66 @@ async def execute_code(
                     )
                 )
 
+    process_started = False
+    capture = BoundedOutputCapture(streams=("stdout", "stderr"))
     try:
-        proc = await asyncio.create_subprocess_exec(
-            python_bin,
-            "-c",
-            code,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(workdir_path),
-            env=safe_env,
+        capture = await BoundedOutputCapture.create("execute_code", streams=("stdout", "stderr"))
+        proc = await create_owned_subprocess_exec(
+            python_bin, "-c", code, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE, cwd=str(workdir_path), env=safe_env,
         )
+        process_started = True
+        process_tree = capture_process_tree_owner(proc, isolated=True)
+        timed_out = False
+        from opensquilla.tools.builtin.shell import (
+            _BACKGROUND_KILL_TIMEOUT,
+            _terminate_exec_process_tree,
+            _wait_exec_process,
+        )
+
+        process_exited = asyncio.Event()
+        stdout_task = asyncio.create_task(capture.drain(
+            proc.stdout, "stdout", process_exited=process_exited,
+            idle_timeout=_BACKGROUND_KILL_TIMEOUT,
+        ))
+        stderr_task = asyncio.create_task(capture.drain(
+            proc.stderr, "stderr", process_exited=process_exited,
+            idle_timeout=_BACKGROUND_KILL_TIMEOUT,
+        ))
+
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except TimeoutError:
-            proc.kill()
-            await proc.communicate()
-            elapsed_ms = (time.monotonic_ns() - start_ns) // 1_000_000
-            return finish(
-                _execution_result_json(
-                    returncode=-1,
-                    stdout="",
-                    stderr=f"Execution timed out after {timeout}s",
-                    timed_out=True,
-                    elapsed_ms=elapsed_ms,
-                )
-            )
-
+            timed_out = not await _wait_exec_process(proc, timeout)
+        finally:
+            try:
+                await asyncio.shield(_terminate_exec_process_tree(proc, process_tree))
+            finally:
+                process_exited.set()
+                try:
+                    results = await asyncio.gather(
+                        stdout_task, stderr_task, return_exceptions=True,
+                    )
+                    for result in results:
+                        if isinstance(result, BaseException):
+                            raise result
+                finally:
+                    await capture.finish_async()
         elapsed_ms = (time.monotonic_ns() - start_ns) // 1_000_000
-        stdout = decode_subprocess_output(stdout_bytes)
-        stderr = decode_subprocess_output(stderr_bytes)
-
-        return finish(
-            _execution_result_json(
-                returncode=proc.returncode if proc.returncode is not None else -1,
-                stdout=stdout,
-                stderr=stderr,
-                timed_out=False,
-                elapsed_ms=elapsed_ms,
-            )
-        )
+        stderr = capture.preview("stderr")
+        if timed_out:
+            stderr += f"\nExecution timed out after {timeout}s"
+        return finish(_execution_result_json(
+            returncode=-1 if timed_out else (proc.returncode or 0),
+            stdout=capture.preview("stdout"), stderr=stderr,
+            timed_out=timed_out, elapsed_ms=elapsed_ms, capture=capture,
+        ))
     except Exception as exc:
-        return finish(
-            _execution_result_json(
-                returncode=-1,
-                stdout="",
-                stderr=f"Execution error: {exc}",
-                timed_out=False,
-                elapsed_ms=0,
-            )
-        )
+        await capture.finish_async()
+        return finish(_execution_result_json(
+            returncode=-1, stdout=capture.preview("stdout"),
+            stderr=capture.preview("stderr") + f"\nExecution error: {exc}",
+            timed_out=False, elapsed_ms=0, capture=capture,
+        ), executed=process_started)
     finally:
+        await capture.finish_async()
         if cleanup_dir:
             shutil.rmtree(cleanup_dir, ignore_errors=True)

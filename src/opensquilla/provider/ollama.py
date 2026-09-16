@@ -22,6 +22,7 @@ from .error_redaction import (
     redact_upstream_error_text,
     redacted_httpx_error,
 )
+from .failures import CONNECTION_FAILED_CODE, is_connection_failure, retry_after_from_headers
 from .request_proof import (
     ProviderRequestBudgetExceededError,
     project_final_request_payload,
@@ -40,6 +41,7 @@ from .types import (
     StreamEvent,
     TextDeltaEvent,
     ToolDefinition,
+    ToolUseStartEvent,
 )
 
 log = structlog.get_logger(__name__)
@@ -147,14 +149,19 @@ def _build_ollama_messages(
             tool_messages.append(tool_message)
 
     out: list[dict[str, Any]] = []
+    main: dict[str, Any] | None = None
     if text_parts or tool_calls or images:
-        main: dict[str, Any] = {"role": msg.role, "content": " ".join(text_parts)}
+        main = {"role": msg.role, "content": " ".join(text_parts)}
         if tool_calls:
             main["tool_calls"] = tool_calls
         if images:
             main["images"] = images
-        out.append(main)
+    # Tool results must immediately follow the assistant call.  If the same
+    # logical message also carries a screenshot, send the pixels in a trailing
+    # user message rather than attaching them to the ``role=tool`` payload.
     out.extend(tool_messages)
+    if main is not None:
+        out.append(main)
     return out
 
 
@@ -367,6 +374,7 @@ class OllamaProvider:
         tools_acc = ToolStreamAccumulator()
         prepared_tool_events: list[StreamEvent] = []
         prepared_tool_calls: list[dict[str, Any]] = []
+        recognized_tool_starts: list[ToolUseStartEvent] = []
         candidate_call_key = 0
         saw_done = False
 
@@ -404,6 +412,9 @@ class OllamaProvider:
                         yield ErrorEvent(
                             message=message,
                             code=str(response.status_code),
+                            retry_after_s=retry_after_from_headers(
+                                response.status_code, getattr(response, "headers", None)
+                            ),
                         )
                         return
 
@@ -486,6 +497,8 @@ class OllamaProvider:
                             else:
                                 message = "Ollama stream contained malformed tool calls"
                                 trace.record_error(code="incomplete_tool_call", message=message)
+                                for start_event in recognized_tool_starts:
+                                    yield start_event
                                 yield ErrorEvent(message=message, code="incomplete_tool_call")
                                 return
                         for tc in raw_tool_calls:
@@ -505,6 +518,8 @@ class OllamaProvider:
                                     continue
                                 message = "Ollama stream contained a malformed tool call"
                                 trace.record_error(code="incomplete_tool_call", message=message)
+                                for start_event in recognized_tool_starts:
+                                    yield start_event
                                 yield ErrorEvent(message=message, code="incomplete_tool_call")
                                 return
                             fn = tc.get("function", {})
@@ -524,6 +539,8 @@ class OllamaProvider:
                                     continue
                                 message = "Ollama stream contained a malformed tool function"
                                 trace.record_error(code="incomplete_tool_call", message=message)
+                                for start_event in recognized_tool_starts:
+                                    yield start_event
                                 yield ErrorEvent(message=message, code="incomplete_tool_call")
                                 return
                             raw_tool_id = tc.get("id")
@@ -555,6 +572,8 @@ class OllamaProvider:
                             ):
                                 message = "Ollama stream contained an invalid tool call id"
                                 trace.record_error(code="incomplete_tool_call", message=message)
+                                for start_event in recognized_tool_starts:
+                                    yield start_event
                                 yield ErrorEvent(message=message, code="incomplete_tool_call")
                                 return
                             key = tools_acc.next_int_key()
@@ -566,13 +585,36 @@ class OllamaProvider:
                             tool_name = fn.get("name", "")
                             arguments = fn.get("arguments", {})
                             try:
+                                start_events = tools_acc.start(
+                                    key,
+                                    tool_use_id=tool_use_id,
+                                    tool_name=tool_name,
+                                )
+                            except ToolStreamProtocolError as exc:
+                                message = (
+                                    "Ollama response contained an invalid tool lifecycle"
+                                )
+                                trace.record_error(
+                                    code="incomplete_tool_call",
+                                    message=message,
+                                    metadata={"reason": exc.reason, "phase": "stream"},
+                                )
+                                for start_event in recognized_tool_starts:
+                                    yield start_event
+                                yield ErrorEvent(
+                                    message=message,
+                                    code="incomplete_tool_call",
+                                )
+                                return
+                            recognized_tool_starts.extend(
+                                event
+                                for event in start_events
+                                if isinstance(event, ToolUseStartEvent)
+                            )
+                            try:
                                 arguments_json = json.dumps(arguments, allow_nan=False)
                                 call_events = [
-                                    *tools_acc.start(
-                                        key,
-                                        tool_use_id=tool_use_id,
-                                        tool_name=tool_name,
-                                    ),
+                                    *start_events,
                                     *tools_acc.append(key, arguments_json),
                                     *tools_acc.finish_with_arguments(key, arguments),
                                 ]
@@ -596,6 +638,8 @@ class OllamaProvider:
                                     message=message,
                                     metadata={"reason": reason, "phase": "stream"},
                                 )
+                                for start_event in recognized_tool_starts:
+                                    yield start_event
                                 yield ErrorEvent(
                                     message=message,
                                     code="incomplete_tool_call",
@@ -696,21 +740,23 @@ class OllamaProvider:
             )
             yield ErrorEvent(message=message, code="candidate_artifact_limit_exceeded")
         except httpx.TimeoutException as exc:
+            code = CONNECTION_FAILED_CODE if is_connection_failure(exc) else "timeout"
             message = redact_upstream_error_text(
                 f"Request timed out: {str(exc) or repr(exc)}",
                 api_key=self._api_key,
                 max_len=2000,
             )
-            trace.record_error(code="timeout", message=message)
-            yield ErrorEvent(message=message, code="timeout")
+            trace.record_error(code=code, message=message)
+            yield ErrorEvent(message=message, code=code)
         except httpx.RequestError as exc:
+            code = CONNECTION_FAILED_CODE if is_connection_failure(exc) else "request_error"
             message = redact_upstream_error_text(
                 f"Request error: {str(exc) or repr(exc)}",
                 api_key=self._api_key,
                 max_len=2000,
             )
-            trace.record_error(code="request_error", message=message)
-            yield ErrorEvent(message=message, code="request_error")
+            trace.record_error(code=code, message=message)
+            yield ErrorEvent(message=message, code=code)
         except Exception as exc:  # noqa: BLE001 - chat() contract: ErrorEvent instead of raising
             message = redact_upstream_error_text(
                 f"Provider response handling failed: {str(exc) or repr(exc)}",
@@ -721,7 +767,6 @@ class OllamaProvider:
                 "provider.stream_internal_error",
                 provider=self.provider_name,
                 model=self._model,
-                error=message,
                 exception_type=type(exc).__name__,
             )
             trace.record_error(
@@ -756,7 +801,7 @@ class OllamaProvider:
                 data = resp.json()
                 return [
                     ModelInfo(
-                        provider=self.provider_name,
+                        provider=self.provider_id,
                         model_id=m["name"],
                         display_name=m.get("name", ""),
                         context_window=m.get("details", {}).get("context_length", 0),

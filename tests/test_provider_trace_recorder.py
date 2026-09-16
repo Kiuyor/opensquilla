@@ -26,7 +26,11 @@ def test_llm_trace_recorder_writes_full_payload_and_redacts_headers(
         stream=True,
     )
     recorder.record_request(
-        payload={"model": "qwen3.6-flash", "messages": [{"role": "user", "content": "hi"}]},
+        payload={
+            "model": "qwen3.6-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+            "vendor_options": {"api_key": "nested-secret"},
+        },
         headers={
             "Authorization": "Bearer secret",
             "Content-Type": "application/json",
@@ -37,6 +41,7 @@ def test_llm_trace_recorder_writes_full_payload_and_redacts_headers(
             "X-OpenSquilla-Call-Kind": "agent.chat",
         },
     )
+    recorder.record_response_headers(response_ids=["gen-safe-1"])
     recorder.record_chunk({"id": "chatcmpl-1", "choices": [{"delta": {"content": "ok"}}]})
     recorder.record_response(
         usage={"input_tokens": 3, "cached_tokens": 2},
@@ -49,10 +54,12 @@ def test_llm_trace_recorder_writes_full_payload_and_redacts_headers(
     rows = _jsonl(path)
     assert [row["event"] for row in rows] == [
         "llm.request",
+        "llm.response_headers",
         "llm.response_chunk",
         "llm.response",
     ]
     assert rows[0]["payload"]["messages"][0]["content"] == "hi"
+    assert rows[0]["payload"]["vendor_options"]["api_key"] == "[REDACTED]"
     assert rows[0]["headers"]["Authorization"] == "[REDACTED]"
     assert rows[0]["headers"]["X-OpenSquilla-Install-Id"] == "[PRESENT]"
     assert rows[0]["headers"]["X-OpenSquilla-Session-Id"] == "[PRESENT]"
@@ -65,7 +72,20 @@ def test_llm_trace_recorder_writes_full_payload_and_redacts_headers(
     assert "turn-1" not in serialized
     assert "execution-1" not in serialized
     assert "agent.chat" not in serialized
-    assert rows[2]["usage"]["cached_tokens"] == 2
+    assert rows[1]["response_ids"] == ["gen-safe-1"]
+    assert set(rows[1]) == {
+        "base_url",
+        "call_id",
+        "call_index",
+        "created_at",
+        "endpoint",
+        "event",
+        "model",
+        "provider",
+        "response_ids",
+        "stream",
+    }
+    assert rows[3]["usage"]["cached_tokens"] == 2
 
 
 def test_llm_trace_recorder_off_does_not_write(tmp_path, monkeypatch) -> None:

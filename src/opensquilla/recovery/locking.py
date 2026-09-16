@@ -317,6 +317,17 @@ def _prepare_posix_lock_file(path: Path, root: Path) -> int:
         flags |= getattr(os, "O_NOFOLLOW", 0)
         try:
             fd = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
+        except FileNotFoundError:
+            # Darwin can report ENOENT to one of two simultaneous openat
+            # callers racing to create the same O_NOFOLLOW leaf. Retrying the
+            # same no-follow operation preserves the safety check and opens
+            # the regular file created by the winning caller.
+            try:
+                fd = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
+            except OSError as exc:
+                raise UnsafePathError(
+                    f"cannot open profile lock without following links: {path}"
+                ) from exc
         except OSError as exc:
             raise UnsafePathError(
                 f"cannot open profile lock without following links: {path}"
@@ -1363,6 +1374,26 @@ class ProfileOperationLock:
         self.release()
 
 
+def profile_operation_lock_held_by_current_thread(home: str | Path) -> bool:
+    """Return whether this thread owns the profile's writer capability.
+
+    This is an in-process capability check, not a probe that acquires or
+    releases the cross-process lock.  Composition roots use it when an outer
+    lifecycle already owns the lease and nested service construction must not
+    increment the re-entrant lock count merely to prove that ownership.
+    """
+
+    key = profile_lock_key(Path(home).expanduser())
+    with _LOCKS_GUARD:
+        _refresh_after_fork()
+        held = _PROCESS_LOCKS.get(key)
+        return bool(
+            held is not None
+            and held.count > 0
+            and held.owner_thread == threading.get_ident()
+        )
+
+
 class LegacyGatewayLock:
     """Probe/hold the pre-RC4 gateway PID lock during offline mutations.
 
@@ -1888,6 +1919,7 @@ __all__ = [
     "acquire_profile_locks",
     "effective_state_roots",
     "move_profile_no_replace",
+    "profile_operation_lock_held_by_current_thread",
     "profile_lock_key",
     "profile_lock_path",
     "replacement_history_lock_scope",
