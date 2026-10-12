@@ -263,6 +263,49 @@ def test_upgrade_load_survives_changed_source(
 
 
 @pytest.mark.parametrize("loader", _CONFIG_LOADERS, ids=_CONFIG_LOADER_IDS)
+def test_upgrade_load_survives_symlink_resolution_race(
+    loader: Callable[[Path], GatewayConfig],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    target = tmp_path / "config.toml"
+    target.write_bytes(_MIGRATING_TOML)
+    rewrite = migration_module.rewrite_migrated_config_best_effort
+    target_io = migration_module.native_io_path(target)
+    original_is_symlink = Path.is_symlink
+
+    def resolve_loop(path: Path, *args: Any, **kwargs: Any) -> Path:
+        raise RuntimeError("synthetic symlink loop after validation")
+
+    def rewrite_after_link_changed(path: Path, migration: Any) -> None:
+        # Inject only after initial parsing and validation have succeeded.
+        with monkeypatch.context() as context:
+            context.setattr(
+                Path, "is_symlink", lambda p: p == target_io or original_is_symlink(p)
+            )
+            context.setattr(Path, "resolve", resolve_loop)
+            rewrite(path, migration)
+
+    monkeypatch.setattr(
+        gateway_config_module, "rewrite_migrated_config_best_effort", rewrite_after_link_changed
+    )
+    monkeypatch.setattr(
+        config_store, "rewrite_migrated_config_best_effort", rewrite_after_link_changed
+    )
+
+    with caplog.at_level(logging.WARNING, logger="opensquilla.gateway.config_migration"):
+        loaded = loader(target)
+
+    assert loaded.port == 18795
+    assert loaded.llm_ensemble.proposer_timeout_seconds == 3600.0
+    assert loaded.config_version == LATEST_CONFIG_VERSION
+    assert target.read_bytes() == _MIGRATING_TOML
+    assert not list(tmp_path.glob("config.toml.backup.*"))
+    assert any(getattr(r, "rewrite", None) == "skipped-conflict" for r in caplog.records)
+
+
+@pytest.mark.parametrize("loader", _CONFIG_LOADERS, ids=_CONFIG_LOADER_IDS)
 @pytest.mark.parametrize("failure_stage", ["lock", "backup", "replace"])
 def test_upgrade_load_does_not_require_migration_write_access(
     loader: Callable[[Path], GatewayConfig],
@@ -430,6 +473,41 @@ def test_migration_handles_unchanged_nan_values_without_missing_real_conflicts(
         backups = list(tmp_path.glob("config.toml.backup.*"))
         assert len(backups) == 1
         assert backups[0].read_bytes() == raw
+
+
+@pytest.mark.parametrize(
+    ("original_value", "edited_value"),
+    [("1", "true"), ("1", "1.0"), ("1.0", "1")],
+    ids=["integer-to-boolean", "integer-to-float", "float-to-integer"],
+)
+def test_migration_keeps_concurrent_toml_type_changes(
+    original_value: str,
+    edited_value: str,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # NaN exercises the real whole-file fallback rather than a mocked patcher.
+    raw = _MIGRATING_TOML + (
+        "\n[memory]\nmmr_lambda = nan\n"
+        '[llm]\nprovider = "custom"\n'
+        f"[llm.extra_body]\nvalue = {original_value}\n"
+    ).encode()
+    target = tmp_path / "config.toml"
+    migration = migrate_config_payload(tomllib.loads(raw.decode("utf-8")))
+    assert migration.changed
+    GatewayConfig(**migration.payload)
+    disk_bytes = raw.replace(
+        f"value = {original_value}\n".encode(),
+        f"value = {edited_value}\n".encode(),
+    )
+    target.write_bytes(disk_bytes)
+
+    with caplog.at_level(logging.WARNING, logger="opensquilla.gateway.config_migration"):
+        migration_module.rewrite_migrated_config_best_effort(target, migration)
+
+    assert target.read_bytes() == disk_bytes
+    assert not list(tmp_path.glob("config.toml.backup.*"))
+    assert any(getattr(r, "rewrite", None) == "skipped-conflict" for r in caplog.records)
 
 
 def test_config_backups_keep_only_the_newest_n(tmp_path: Path) -> None:

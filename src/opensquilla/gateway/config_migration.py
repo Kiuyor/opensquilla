@@ -953,6 +953,8 @@ class ConfigMigrationConflictError(ValueError):
 
 def _same_toml_payload(left: Any, right: Any) -> bool:
     """Compare parsed TOML without treating unchanged NaN values as conflicts."""
+    if type(left) is not type(right):
+        return False
     if isinstance(left, dict) and isinstance(right, dict):
         return left.keys() == right.keys() and all(
             _same_toml_payload(value, right[key]) for key, value in left.items()
@@ -1035,7 +1037,13 @@ def backup_and_write_migrated_config(
     target = Path(path)
     target_io = native_io_path(target)
     if target_io.is_symlink():
-        target = _logical_path_from_io(target_io.resolve())
+        try:
+            target = _logical_path_from_io(target_io.resolve())
+        except RuntimeError as exc:
+            # A link changed into a loop after validation must not block load.
+            raise ConfigMigrationConflictError(
+                "source config link changed since validation"
+            ) from exc
         target_io = native_io_path(target)
     rewrite = "comment-preserving"
     lossless_error: str | None = None
