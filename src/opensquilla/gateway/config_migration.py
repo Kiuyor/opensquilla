@@ -6,9 +6,11 @@ import copy
 import datetime
 import json
 import logging
+import math
 import os
 import tempfile
 import threading
+import tomllib
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -945,7 +947,29 @@ _MIGRATIONS: list[tuple[int, Callable[[_MigrationBuilder], None]]] = [
 ]
 
 
-def atomic_replace_bytes(target: str | Path, data: bytes) -> None:
+class ConfigMigrationConflictError(ValueError):
+    """A migration must not replace a config changed since validation."""
+
+
+def _same_toml_payload(left: Any, right: Any) -> bool:
+    """Compare parsed TOML without treating unchanged NaN values as conflicts."""
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(
+            _same_toml_payload(value, right[key]) for key, value in left.items()
+        )
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            _same_toml_payload(a, b) for a, b in zip(left, right, strict=True)
+        )
+    if isinstance(left, float) and isinstance(right, float):
+        if math.isnan(left) and math.isnan(right):
+            return True
+    return left == right
+
+
+def atomic_replace_bytes(
+    target: str | Path, data: bytes, *, expected_bytes: bytes | None = None
+) -> None:
     """Atomically replace one config file with exact bytes (same-dir temp, fsync, 0600).
 
     Every writer that replaces ``config.toml`` converges on this helper so the
@@ -967,6 +991,11 @@ def atomic_replace_bytes(target: str | Path, data: bytes) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         os.chmod(tmp_name, 0o600)
+        if (
+            expected_bytes is not None
+            and native_io_path(target_path).read_bytes() != expected_bytes
+        ):
+            raise ConfigMigrationConflictError("source config changed while preparing migration")
         os.replace(tmp_name, native_io_path(target_path))
     except Exception:
         try:
@@ -993,32 +1022,40 @@ def backup_and_write_migrated_config(
 ) -> Path:
     """Back up and atomically replace a migrated user config file.
 
-    The rewrite first patches the exact bytes on disk through the
-    comment-preserving ``patch_import_config``; only when that patcher cannot
-    prove the mapped result does it fall back to serializing the whole payload.
-    Both branches share one backup, and the structured warning records which
-    rewrite ran. Falling back (instead of the fail-closed posture used on the
-    import paths) is deliberate: this helper runs on the startup load path,
-    where the alternative to patching is the previous whole-file rewrite, not
-    a half-migrated import.
+    Only a source matching the validated payload may be migrated. Unsupported
+    lossless patches retain the previous full-serialization fallback, but a
+    changed source never falls back to writing the stale payload. A nonblocking
+    shared write lock keeps startup from waiting on another config persister;
+    both rewrite paths also verify the source bytes immediately before replace.
     """
+    # Import after GatewayConfig has finished loading its module: config_store
+    # itself imports the config models and migration helpers.
+    from opensquilla.onboarding.config_store import _config_write_lock, _logical_path_from_io
+
     target = Path(path)
-    backup = make_config_backup(target)
+    target_io = native_io_path(target)
+    if target_io.is_symlink():
+        target = _logical_path_from_io(target_io.resolve())
+        target_io = native_io_path(target)
     rewrite = "comment-preserving"
     lossless_error: str | None = None
-    try:
-        patched = patch_import_config(
-            native_io_path(target).read_bytes(),
-            result.original,
-            payload,
-        )
-    except LosslessTomlPatchError as exc:
-        rewrite = "full-reserialize"
-        lossless_error = str(exc)
-        atomic_write_config(target, payload)
-    else:
-        atomic_replace_bytes(target, patched)
-    os.chmod(native_io_path(target), 0o600)
+    with _config_write_lock(target, blocking=False):
+        source_bytes = target_io.read_bytes()
+        try:
+            source_payload = tomllib.loads(source_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            raise ConfigMigrationConflictError("source config changed since validation") from exc
+        if not _same_toml_payload(source_payload, result.original):
+            raise ConfigMigrationConflictError("source config changed since validation")
+        try:
+            patched = patch_import_config(source_bytes, result.original, payload)
+        except LosslessTomlPatchError as exc:
+            rewrite = "full-reserialize"
+            lossless_error = str(exc)
+            patched = tomli_w.dumps(payload).encode("utf-8")
+        backup = make_config_backup(target)
+        atomic_replace_bytes(target, patched, expected_bytes=source_bytes)
+        os.chmod(target_io, 0o600)
     extra: dict[str, Any] = {
         "path": str(target),
         "backup": str(backup),
@@ -1042,11 +1079,19 @@ def rewrite_migrated_config_best_effort(
     """Persist an already validated migration without making writes a load prerequisite."""
     try:
         backup_and_write_migrated_config(path, migration.payload, migration)
+    except ConfigMigrationConflictError as error:
+        logging.getLogger(__name__).warning(
+            "OpenSquilla config migration skipped for %s (%s); running from the "
+            "migrated payload in memory without overwriting the changed file.",
+            path,
+            error,
+            extra={"path": str(path), "rewrite": "skipped-conflict"},
+        )
     except OSError as error:
         logging.getLogger(__name__).warning(
             "OpenSquilla config migration could not rewrite %s (%s); running "
-            "from the migrated payload in memory. Make the file writable to "
-            "persist the migration and silence this warning.",
+            "from the migrated payload in memory. Persistence will be retried "
+            "on a later load.",
             path,
             error,
         )
