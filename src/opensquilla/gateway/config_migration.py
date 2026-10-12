@@ -964,7 +964,7 @@ def _same_toml_payload(left: Any, right: Any) -> bool:
     if isinstance(left, float) and isinstance(right, float):
         if math.isnan(left) and math.isnan(right):
             return True
-    return left == right
+    return bool(left == right)
 
 
 def atomic_replace_bytes(
